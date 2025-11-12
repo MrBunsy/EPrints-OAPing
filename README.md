@@ -3,6 +3,8 @@
 *Alternative EPrints extension for sending usage pings to the OpenAIRE Matomo
 tracking API*
 
+⚠️⚠️ This code is still being tested. Please don't use in production yet. ⚠️⚠️
+
 ## Installation
 
 You can install this extension in several different ways:
