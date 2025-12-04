@@ -84,17 +84,9 @@ if ( $c->{oaping}->{legacy_loaded} )
 			# Convert to string:
 			my $canonical_url = $request_url->canonical()->as_string();
 
-			# Create job to send (internal_uri will be converted to object):
-			EPrints::DataObj::EventQueue->create_unique(
-				$repo,
-				{
-					start_time => EPrints::Time::iso_datetime( time() ),
-					pluginid   => 'Event::OAPingEvent',
-					action     => 'notify',
-					params     => [ $access->internal_uri, $canonical_url ],
-				}
-			);
-
+			# Notify immediately, to avoid clogging up indexer when busy:
+			my $plugin = $repo->plugin('Event::OAPingEvent');
+			$plugin->notify( $access, $canonical_url );
 		}
 	);
 }

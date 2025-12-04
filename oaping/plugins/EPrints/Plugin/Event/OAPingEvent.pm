@@ -963,7 +963,7 @@ Write message to Indexer log.
 sub _log
 {
 	my ( $self, $msg ) = @_;
-	$self->{repository}->log("PureEvent::$msg");
+	$self->{repository}->log("OAPingEvent::$msg");
 	select()->flush();
 	return;
 }
