@@ -43,6 +43,16 @@ You can change this URL if necessary.
 
 $c->{oaping}->{tracker} = 'https://analytics.openaire.eu/piwik.php';
 
+=item $c->{oaping}->{max_payload}
+
+The maximum number of access pings to send in a single bulk request. OpenAIRE's
+official generic solution defaults to 100. As bulk requests are typically made
+at least 60 seconds apart, busy repositories might need a higher value.
+
+=cut
+
+$c->{oaping}->{max_payload} = 100;
+
 =item $c->{oaping}->{verbosity}
 
 Set to 1 to log each Access ID that is successfully tracked.

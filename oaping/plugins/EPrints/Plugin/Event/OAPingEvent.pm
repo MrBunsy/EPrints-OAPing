@@ -12,6 +12,7 @@ Relies on the following configuration settings:
 
 	# cfg.d/oaping.pl
 	$c->{oaping}->{tracker} - tracker URL
+	$c->{oaping}->{max_payload} - limit of pings in one bulk request
 	$c->{oaping}->{verbosity} - 0 or 1
 
 	# cfg.d/x_oaping.pl
@@ -155,7 +156,7 @@ sub legacy_notify
 	my $repo = $self->{repository};
 
 	# Maximum number of events in one upload:
-	my $size = 100;
+	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
 
 	my $json    = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
 	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
@@ -311,7 +312,7 @@ sub safe_notify
 	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
 
 	# Maximum number of events in one upload:
-	my $size = 100;
+	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
 
 	my $msg;
 
@@ -467,7 +468,7 @@ sub retry
 {
 	my ($self) = @_;
 	my $repo   = $self->{repository};
-	my $size   = 100;
+	my $size   = $repo->config( 'oaping', 'max_payload' ) // 100;
 	my $msg;
 
 	my @accesses = $self->_unstash();
