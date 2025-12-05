@@ -290,7 +290,7 @@ sub legacy_notify
 	return HTTP_OK;
 }
 
-=item $status = $self->notify( $self, $access, $request_url )
+=item $status = $self->safe_notify( $self, $access, $request_url )
 
 Notifies the tracker about the given C<$access> event.
 
@@ -303,7 +303,7 @@ ready for next time.
 
 =cut
 
-sub notify
+sub safe_notify
 {
 	my ( $self, $access, $request_url ) = @_;
 	my $repo = $self->{repository};
@@ -422,6 +422,112 @@ sub notify
 	else
 	{
 		$self->_log("notify: $msg");
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+}
+
+=item $status = $self->notify( $self, $access, $request_url )
+
+Notifies the tracker about the given C<$access> event.
+
+In contrast to C<safe_notify>, does not check for previously missed pings.
+
+=cut
+
+sub notify
+{
+	my ( $self, $access, $request_url ) = @_;
+	my $repo = $self->{repository};
+
+	my $msg = $self->_ping( $access, $request_url );
+	if ( $msg =~ m/^Sent/ )
+	{
+		if ( $repo->config( 'oaping', 'verbosity' ) )
+		{
+			$self->_log("notify: $msg");
+		}
+		return HTTP_OK;
+	}
+	else
+	{
+		$self->_log("notify: $msg");
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+}
+
+=item $status = $self->retry( $self )
+
+If there are stashed events, they will be unstashed. The chronologically
+first 100 will be sent as a bulk tracking request. If there are any left
+over, they are stashed again and the job respawns.
+
+=cut
+
+sub retry
+{
+	my ($self) = @_;
+	my $repo   = $self->{repository};
+	my $size   = 100;
+	my $msg;
+
+	my @accesses = $self->_unstash();
+	if ( !@accesses )
+	{
+		return HTTP_OK;
+	}
+	if ( @accesses > $size )
+	{
+		# Bulk ping will sort entries, but if choosing, need to choose
+		# the earliest ones:
+		my @sorted_accesses =
+		  sort { $a->[0]->value('datestamp') cmp $b->[0]->value('datestamp') }
+		  @accesses;
+		my @batch = @sorted_accesses[ 0 .. ( $size - 1 ) ];
+		$msg = $self->_bulk_ping( \@batch, 1 );
+		$self->_log("retry: $msg");
+
+		# Stash the remainder:
+		my @stashed;
+		for my $tuple ( @sorted_accesses[ $size .. $#sorted_accesses ] )
+		{
+			push @stashed, $tuple;
+			my ( $deferred_access, $deferred_request_url ) = @{$tuple};
+			$self->_stash( $deferred_access, $deferred_request_url );
+		}
+		$self->_err_log(
+			'Too many stashed access events, saving some for next time.',
+			stashed => \@stashed );
+
+		# Tell the indexer to retry this job.
+		my $event = $self->{event};
+		if ( $msg =~ m/^Sent/ )
+		{
+			# Success - wait 1 min
+			$event->set_value( 'start_time',
+				EPrints::Time::iso_datetime( time() + 60 ) );
+		}
+		else
+		{
+			# Failure - wait 10 min
+			$event->set_value( 'start_time',
+				EPrints::Time::iso_datetime( time() + ( 10 * 60 ) ) );
+		}
+
+		# Set status to 'waiting' and commit:
+		return HTTP_RESET_CONTENT;
+	}
+	else
+	{
+		$msg = $self->_bulk_ping( \@accesses, 1 );
+		$self->_log("retry: $msg");
+	}
+
+	if ( $msg =~ m/^Sent/ )
+	{
+		return HTTP_OK;
+	}
+	else
+	{
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 }
@@ -652,6 +758,8 @@ plugin.
 
 If C<$is_recovery> evaluates true, successfully sent access events will be
 logged, so they can be compared against the lists of previously stashed ones.
+
+Any events that failed to send are stashed.
 
 Returns a log message indicating how it went.
 
@@ -971,7 +1079,7 @@ sub _log
 =item $message = $self->_ping( $access, [ $request_url ] )
 
 Sends a ping to the configured Matomo Tracking HTTP API, representing a single
-access event.
+access event. On failure, the event is stashed.
 
 A request URL will be calculated if blank or undefined.
 

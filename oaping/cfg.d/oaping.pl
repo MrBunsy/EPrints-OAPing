@@ -51,23 +51,27 @@ Set to 1 to log each Access ID that is successfully tracked.
 
 $c->{oaping}->{verbosity} = 0;
 
-=item $c->{oaping}->{legacy_loaded}
+=item $c->{oaping}->{notify_mode}
 
 If you are installing the plugin into a running repository and want to send
-tracking information for historic Accesses, leave C<legacy_loaded> set to 0 and
-run the C<legacy_notify> job as your first step. Set C<legacy_loaded> to 1 once
+tracking information for historic Accesses, leave C<notify_mode> set to 0 and
+run the C<legacy_notify> job as your first step. Set C<notify_mode> to 1 once
 the C<legacy_notify> job reports it is up to date.
 
-Otherwise, set C<legacy_loaded> to 1 to start tracking new Accesses immediately.
-
+Otherwise, set C<notify_mode> to 1 to start tracking new Accesses immediately.
 This setting installs a trigger that activates when a new access event is logged
-in the database, creating a new C<notify> job in the Indexer.
+in the database.
+
+When you are happy that everything is working, you can set C<notify_mode> to 2.
+This is more efficient than mode 1 but does not handle the transition from
+C<legacy_notify> and, when recovering from errors, new pings will likely be sent
+before older failed pings are retried.
 
 =cut
 
-$c->{oaping}->{legacy_loaded} = 0;
+$c->{oaping}->{notify_mode} = 0;
 
-if ( $c->{oaping}->{legacy_loaded} )
+if ( $c->{oaping}->{notify_mode} == 2 )
 {
 	$c->add_dataset_trigger(
 		'access',
@@ -84,9 +88,51 @@ if ( $c->{oaping}->{legacy_loaded} )
 			# Convert to string:
 			my $canonical_url = $request_url->canonical()->as_string();
 
-			# Notify immediately, to avoid clogging up indexer when busy:
 			my $plugin = $repo->plugin('Event::OAPingEvent');
-			$plugin->notify( $access, $canonical_url );
+			my $status = $plugin->notify( $access, $canonical_url );
+
+			if ( $status != EPrints::Const::HTTP_OK )
+			{
+				# Retry 5 mins after last unsuccessful ping:
+				my $start_time =
+				  EPrints::Time::iso_datetime( time() + ( 5 * 60 ) );
+				my $event = EPrints::DataObj::EventQueue->create_unique(
+					$repo,
+					{
+						start_time => $start_time,
+						pluginid   => $plugin->get_id,
+						action     => 'retry',
+					}
+				);
+				if ( $event->get_value('start_time') lt $start_time )
+				{
+					# Task was already set to run sooner, so delay start time:
+					$event->set_value( 'start_time', $start_time );
+					$event->commit;
+				}
+			}
+		}
+	);
+}
+elsif ( $c->{oaping}->{notify_mode} )
+{
+	$c->add_dataset_trigger(
+		'access',
+		EPrints::Const::EP_TRIGGER_CREATED,
+		sub {
+			my (%args) = @_;
+
+			my $repo   = $args{repository};
+			my $access = $args{dataobj};
+
+			# Get current request URL as a URI object:
+			my $request_url = $repo->current_url( host => 1 );
+
+			# Convert to string:
+			my $canonical_url = $request_url->canonical()->as_string();
+
+			my $plugin = $repo->plugin('Event::OAPingEvent');
+			$plugin->safe_notify( $access, $canonical_url );
 		}
 	);
 }
