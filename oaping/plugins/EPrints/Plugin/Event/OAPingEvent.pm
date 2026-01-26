@@ -56,7 +56,7 @@ as for error recovery.
 package EPrints::Plugin::Event::OAPingEvent;
 
 use strict;
-use v5.34;
+# use v5.34;
 
 our $VERSION = v1.0.0;
 our @ISA     = qw( EPrints::Plugin::Event );
@@ -66,6 +66,8 @@ use File::Path qw(make_path);
 use JSON;
 use POSIX qw(strftime);
 use URI;
+use LWP::UserAgent;
+use LWP::ConnCache;
 
 use EPrints::Const
   qw(HTTP_OK HTTP_RESET_CONTENT HTTP_NOT_FOUND HTTP_LOCKED HTTP_INTERNAL_SERVER_ERROR);
@@ -1208,7 +1210,8 @@ sub _ua
 
 	if ( !defined $self->{ua} )
 	{
-		$self->{ua} = LWP::UserAgent->new( conn_cache => LWP::ConnCache->new );
+		my $conn_cache = LWP::ConnCache->new();
+		$self->{ua} = LWP::UserAgent->new( conn_cache => $conn_cache );
 		$self->{ua}->env_proxy;
 	}
 
