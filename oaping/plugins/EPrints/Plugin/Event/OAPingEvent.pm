@@ -66,7 +66,6 @@ use File::Path qw(make_path);
 use JSON;
 use POSIX qw(strftime);
 use URI;
-use LWP::UserAgent;
 use LWP::ConnCache;
 
 use EPrints::Const
@@ -156,7 +155,7 @@ sub legacy_notify
 {
 	my ( $self, $offset, $message ) = @_;
 	my $repo = $self->{repository};
-
+	print STDERR "legacy_notify: offset: $offset message: $message\n";
 	# Maximum number of events in one upload:
 	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
 
@@ -310,7 +309,6 @@ sub safe_notify
 {
 	my ( $self, $access, $request_url ) = @_;
 	my $repo = $self->{repository};
-
 	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
 
 	# Maximum number of events in one upload:
@@ -697,11 +695,11 @@ sub _as_form
 	}
 	$qf_params{url} = $request_url;
 
-	# - apiv
+	# - apiv (API version)
 	$qf_params{apiv} = '1';
 
 	# Optional User info:
-	# - urlref
+	# - urlref (The full HTTP Referrer URL)
 	if ( $access->is_set('referring_entity_id') )
 	{
 		my $referer = $access->value('referring_entity_id');
@@ -709,14 +707,14 @@ sub _as_form
 		$qf_params{urlref} = $referer;
 	}
 
-	# - ua
+	# User Agent
 	if ( $access->is_set('requester_user_agent') )
 	{
 		$qf_params{ua} = $access->value('requester_user_agent');
 	}
 
 	# Optional Action info:
-	# - cvar (stringified JSON containing OAI PMH ID)
+	# - cvar (custom variable, stringified JSON containing OAI PMH ID)
 	if ( $access->is_set('referent_id') )
 	{
 		my $oai_id =
@@ -726,20 +724,20 @@ sub _as_form
 		$qf_params{cvar} = '{"1":["oaipmhID","' . $oai_id . '"]}';
 	}
 
-	# - download
+	# - download (URL of a file the user has downloaded).
 	if ($is_request)
 	{
 		$qf_params{download} = $request_url;
 	}
 
 	# Parameters requiring authentication:
-	# - cip
+	# - cip (Override value for the visitor IP)
 	if ( $access->is_set('requester_id') )
 	{
 		$qf_params{cip} = $access->value('requester_id');
 	}
 
-	# - cdt
+	# - cdt (Override for the datetime of the request)
 	if ( $access->is_set('datestamp') )
 	{
 		$qf_params{cdt} = $access->value('datestamp');
@@ -1119,6 +1117,7 @@ sub _ping
 		{
 			$self->_stash( $access, $request_url );
 			my $error = 'Could not notify of dated access without token_auth';
+			#https://developer.matomo.org/api-reference/tracking-api - "If you set cdt to a datetime older than 24 hours then token_auth must be set."
 			$self->_err_log( $error, stashed => [ [ $access, $request_url ] ] );
 			return $error;
 		}
@@ -1173,7 +1172,7 @@ sub _stash
 	my ( $self, $access, $request_url ) = @_;
 	$request_url //= q();
 	my $repo = $self->{repository};
-
+	print STDERR "OAPing: Stashing $request_url\n";
 	my $panic_msg =
 		"_stash: Could not stash ping for access "
 	  . $access->id . " = "
@@ -1254,6 +1253,8 @@ sub _unstash
 		unlink "$replay_dir/$accessid";
 	}
 	closedir($dh);
+
+	print STDERR "OAPing: unstashing " . scalar(@accesses) . "\n";
 
 	return @accesses;
 }
