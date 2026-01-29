@@ -15,25 +15,24 @@ at provide.openaire.eu, as MatomoID (site identifier) and AuthenticationToken
 $c->{oaping}->{idsite} = '1234';
 $c->{oaping}->{token_auth} = 'abcde';
 
-=item $c->{oaping}->{notify_mode}
+=item $c->{oaping}->{legacy_catchup}
 
 If you are installing the plugin into a running repository and want to send
-tracking information for historic Accesses, leave C<notify_mode> set to 0 and
-run the C<legacy_notify> job as your first step. Set C<notify_mode> to 1 once
-the C<legacy_notify> job reports it is up to date.
+tracking information for historic Accesses, leave C<legacy_catchup> set to 1.
 
-Otherwise, set C<notify_mode> to 1 to start tracking new Accesses immediately.
-This setting installs a trigger that activates when a new access event is logged
-in the database.
-
-When you are happy that everything is working, you can set C<notify_mode> to 2.
-This is more efficient than mode 1 but does not handle the transition from
-C<legacy_notify> and, when recovering from errors, new pings will likely be sent
-before older failed pings are retried.
+Otherwise, set C<notify_mode> to 0 to start tracking new Accesses only.
 
 =cut
 
-$c->{oaping}->{notify_mode}=2;
+$c->{oaping}->{legacy_catchup}=1;
+
+=item $c->{oaping}->{legacy_start_access_id}
+
+If legacy_catchup is enabled, this is the access id it will start from
+
+=cut
+
+$c->{oaping}->{legacy_start_access_id}=1;
 
 =item $c->{oaping}->{max_payload}
 
@@ -48,6 +47,7 @@ $c->{oaping}->{max_payload} = 100;
 =item $c->{oaping}->{verbosity}
 
 Set to 1 to log each Access ID that is successfully tracked.
+Set to 0 for minimal logging.
 
 =cut
 

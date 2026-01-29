@@ -24,7 +24,9 @@ $c->add_dataset_trigger(
 		my $repo   = $args{repository};
 		my $access = $args{dataobj};
 
-		my $notify_mode = $repo->config('oaping', 'notify_mode');
+		my $plugin = $repo->plugin('Event::OAPingEvent');
+
+		$plugin->first_run($repo, $access->id);
 
 		# Get current request URL as a URI object:
 		my $request_url = $repo->current_url( host => 1 );
@@ -33,7 +35,7 @@ $c->add_dataset_trigger(
 
 		# Convert to string:
 		my $canonical_url = $request_url->canonical()->as_string();
-		my $plugin = $repo->plugin('Event::OAPingEvent');
+		
 		my $status = $plugin->notify( $access, $canonical_url );
 
 		if ( $status != EPrints::Const::HTTP_OK )
