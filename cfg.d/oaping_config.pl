@@ -24,7 +24,7 @@ Otherwise, set C<notify_mode> to 0 to start tracking new Accesses only.
 
 =cut
 
-$c->{oaping}->{legacy_catchup}=1;
+$c->{oaping}->{legacy_catchup} = 1;
 
 =item $c->{oaping}->{legacy_start_access_id}
 
@@ -32,7 +32,7 @@ If legacy_catchup is enabled, this is the access id it will start from
 
 =cut
 
-$c->{oaping}->{legacy_start_access_id}=1;
+$c->{oaping}->{legacy_start_access_id} = 1;
 
 =item $c->{oaping}->{max_payload}
 
