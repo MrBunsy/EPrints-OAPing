@@ -1,7 +1,7 @@
 
 =head1 NAME
 
-B<EPrints::Plugin::Event::OAPingEvent> - Event task to ping OpenAIRE
+B<EPrints::Plugin::Event::MatomoEvent> - Event task to ping OpenAIRE
 
 =head1 SYNOPSIS
 
@@ -10,12 +10,12 @@ L<OAPiwik|https://github.com/openaire/EPrints-OAPiwik>.
 
 Relies on the following configuration settings:
 
-	# cfg.d/oaping_config.pl
-	$c->{oaping}->{idsite} - site identifier
-	$c->{oaping}->{token_auth} - authorization token
-	$c->{oaping}->{tracker} - tracker URL
-	$c->{oaping}->{max_payload} - limit of pings in one bulk request
-	$c->{oaping}->{verbosity} - 0 or 1
+	# cfg.d/matomo_config.pl
+	$c->{matomo}->{idsite} - site identifier
+	$c->{matomo}->{token_auth} - authorization token
+	$c->{matomo}->{tracker} - tracker URL
+	$c->{matomo}->{max_payload} - limit of pings in one bulk request
+	$c->{matomo}->{verbosity} - 0 or 1
 	
 
 =head1 DESCRIPTION
@@ -27,7 +27,7 @@ operation.
 
 With C<legacy_notify>, the job goes progresses through the entire table of
 access events. A fake-but-likely request URL is generated for each one. With
-each run of the job, a batch of up to $c->{oaping}->{max_payload} access events is sent to the tracker,
+each run of the job, a batch of up to $c->{matomo}->{max_payload} access events is sent to the tracker,
 progress is recorded in a log for safety, and the job respawns to send the next
 batch in 60 seconds. In the event of an error, the current batch is saved (stashed) to a
 folder, and the job respawns in 60 minutes. On the next run, the saved batch is
@@ -45,7 +45,7 @@ saved to a folder and a retry event scheduled in 5 minutes.
 
 =cut
 
-package EPrints::Plugin::Event::OAPingEvent;
+package EPrints::Plugin::Event::MatomoEvent;
 
 use strict;
 
@@ -58,6 +58,7 @@ use JSON;
 use POSIX qw(strftime);
 use URI;
 use LWP::ConnCache;
+use Date::Calc qw(Add_Delta_Days);
 
 use EPrints::Const
   qw(HTTP_OK HTTP_RESET_CONTENT HTTP_NOT_FOUND HTTP_LOCKED HTTP_INTERNAL_SERVER_ERROR);
@@ -82,11 +83,11 @@ Relative path to folder of failed pings.
 
 Relative path to record of retry attempts.
 
-=item INVESTG
+=item VIEW
 
 Activity name for COUNTER Investigations.
 
-=item REQUEST
+=item DOWNLOAD
 
 Activity name for COUNTER Requests.
 
@@ -95,12 +96,12 @@ Activity name for COUNTER Requests.
 =cut
 
 use constant {
-	LEGACY_LOG => '/oaping-legacy.json',
-	SETUP_DONE => '/oaping-setup',
-	REPLAY_DIR => '/oaping',
-	ERROR_LOG  => '/oaping-error.yaml',
-	INVESTG    => 'View',
-	REQUEST    => 'Download',
+	LEGACY_BATCH_NAME => 'legacy_access',
+	LOG_FILES_DIR => '/matomo/',
+	ERROR_LOG  => '/matomo-error.yaml',
+	VIEW    => 'View',
+	DOWNLOAD    => 'Download',
+	# INTERNAL_TABLE => 'matomo_keyvalues'
 };
 
 =head1 METHODS
@@ -109,7 +110,7 @@ use constant {
 
 =over
 
-=item $event = EPrints::Plugin::Event::OAPingEvent->new( %params )
+=item $event = EPrints::Plugin::Event::MatomoEvent->new( %params )
 
 The constructor has no special parameters of its own: all are passed to
 the parent EPrints::Plugin::Event constructor.
@@ -124,7 +125,14 @@ sub new
 
 	$self->{actions} = [qw( enable disable )];
 
-	$self->{package_name} = "OAPingEvent";
+	$self->{package_name} = "MatomoEvent";
+
+	$self->{json} = JSON->new->allow_nonref(1)->canonical(1)->pretty(1);
+
+	if( defined $self->{session} )
+	{
+		$self->{dbh} = $self->{session}->get_database;
+	}	
 
 	return $self;
 }
@@ -135,9 +143,53 @@ sub new
 
 =over
 
-=item $status = $self->legacy_notify( $self, [ $message, $unique_parameter ] )
+=item $self->trigger_bulk_upload( $batch_name, $from_access_id, $to_access_id )
 
-Notifies the tracker of a batch of legacy access records, starting at the access id of C<$maximum_access_id> from the log file.
+This commences a series of uploads for all the accesses from $from_access_id to $to_access_id in maximum chunks of max_payload
+This must not be run from an Apache thread, only from cron or indexer.
+This will create a log_file for the batch (so $batch_name must be unix file friendly) which tracks progress.
+Indexer tasks will be scheduled until this bulk upload has finished.
+
+returns status of the scheduled task
+=cut
+
+sub trigger_bulk_upload
+{
+	my ( $self, $batch_name, $from_access_id, $to_access_id ) = @_;
+	my $repo = $self->{repository};
+	# Maximum number of events in one upload:
+	my $max_payload = $repo->config( 'matomo', 'max_payload' ) // 100;
+
+	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . $batch_name . ".log";
+	
+	my $log = { tries_since_last_success => 0 };
+	$log->{last_accessid} = $from_access_id;
+	$log->{tries_since_last_success} = 0;
+	$log->{maximum_access_id} = $to_access_id;
+
+	# Save log file
+	open( my $fh, ">", $log_file ) or do
+	{
+		$self->_log("initiate_historic_upload: Could not open $log_file: $!");
+		return HTTP_INTERNAL_SERVER_ERROR;
+	};
+	print $fh $self->{json}->encode($log);
+	close($fh) or warn "Failed to close $log_file: $!";
+
+	# kick off the indexer 
+	my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
+		pluginid => 'Event::MatomoEvent',
+		action => 'bulk_upload_batch',
+		params => [ "First run of reporting legacy access", $batch_name, EPrints::Time::iso_datetime() ],
+	});
+
+	return $event->get_value( "status" )
+
+}
+
+=item $status = $self->bulk_upload_batch( $self, [ $message, $batch_name, $unique_parameter ] )
+
+Notifies the tracker of a batch of legacy access records, starting at the access id of C<$last_accessid> from the log file.
 The C<$message> should be indicative of how the last run went;
 this is a bit of a cheat, in order to make it clear in the Indexer task screen when the legacy upload has finished.
 
@@ -145,111 +197,105 @@ EventQueue->create_unique will return the same event if it has exactly the same 
 
 =cut
 
-sub legacy_notify
+sub bulk_upload_batch
 {
-	my ( $self, $message, $unique_parameter ) = @_;
+	my ( $self, $message, $batch_name, $ignoreme ) = @_;
 	my $repo = $self->{repository};
 	# Maximum number of events in one upload:
-	my $size = $repo->config( 'oaping', 'max_payload' ) // 100;
+	my $max_payload = $repo->config( 'matomo', 'max_payload' ) // 100;
 
-	my $json    = JSON->new->allow_nonref(0)->canonical(1)->pretty(1);
-	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
+	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . $batch_name . ".log";
 
-	my $maximum_access_id = -1;
-
-	# Read log if exists (which it should as first_run should have created it)
+	# Read log if exists (which it should as trigger_bulk_upload should have created it)
 	my $log = { tries_since_last_success => 0 };
-	if ( -f $logfile )
+	if ( -f $log_file )
 	{
-		open( my $fh, "<", $logfile ) or do
+		open( my $fh, "<", $log_file ) or do
 		{
-			$self->_log("legacy_notify: Could not open $logfile: $!");
+			$self->_log("legacy_notify: Could not open $log_file: $!");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
 		my $err = read( $fh, my $logcontent, -s $fh );
 		if ( !defined $err )
 		{
-			$self->_log("legacy_notify: Could not read $logfile: $!");
+			$self->_log("legacy_notify: Could not read $log_file: $!");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
-		close($fh) or warn "Failed to close $logfile: $!";
-		$log = eval { $json->decode($logcontent) } or do
+		close($fh) or warn "Failed to close $log_file: $!";
+		$log = eval { $self->{json}->decode($logcontent) } or do
 		{
-			$self->_log("legacy_notify: Could not parse $logfile: $@");
+			$self->_log("legacy_notify: Could not parse $log_file: $@");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		};
-		if ( exists $log->{maximum_access_id} ){
-			$maximum_access_id = $log->{maximum_access_id};
-		}else{
+		if ( !exists $log->{maximum_access_id} ){
 			$self->_log( "legacy_notify: maximum_access_id not set " );
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 
 	}else{
-		$self->_log( "log file $logfile does not exist. Should have be created at first run." );
+		$self->_log( "log file $log_file does not exist. Should have be created at first run." );
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	$log->{last_run} = EPrints::Time::iso_datetime();
 	$log->{last_accessid} //= 0;
 
-	my $up_to_date = "Up to date";
+	my $success = 0;
+	my $finished = 0;
 
-	# Process stashed records if they exist, otherwise look up new ones
-	my @accesses = $self->_unstash();
-	if (@accesses)
+	my $max_access_id_to_search = $log->{last_accessid} + $max_payload;
+	if ($max_access_id_to_search >= $log->{maximum_access_id}){
+		$max_access_id_to_search = $log->{maximum_access_id} - 1;
+	}
+	my $accesses = $self->_accesses_between( $log->{last_accessid}, $max_access_id_to_search );
+	my $accesses_count = scalar(@{$accesses});
+	if ( $accesses_count > 0 )
 	{
-		$self->_log( "legacy_notify: bulk pinging ".scalar(@accesses)." stashed accesses." );
-		$log->{message} = $self->_bulk_ping( \@accesses, 1 );
+		$self->_log( "bulk_upload_batch: bulk pinging ".$accesses_count." accesses from ".$log->{last_accessid}." to $max_access_id_to_search" );
+		
+		$success = $self->_bulk_ping( $accesses );
+		if($success){
+			$log->{last_accessid} = $max_access_id_to_search;
+			$log->{message} = "Successfully uploaded $accesses_count access entries";
+		}else{
+			$log->{message} = "Failed to upload access entries";
+		}
 	}
 	else
 	{
-		my $max_access_id_to_search = $log->{last_accessid} + $size;
-		if ($max_access_id_to_search >= $log->{maximum_access_id}){
-			$max_access_id_to_search = $log->{maximum_access_id} - 1;
-		}
-		@accesses = $self->_accesses_between( $log->{last_accessid}, $max_access_id_to_search );
-		if ( scalar(@accesses) > 0 )
-		{
-			$self->_log( "legacy_notify: bulk pinging ".scalar(@accesses)." accesses from ".$log->{last_accessid}." to $max_access_id_to_search" );
-			# _bulk_ping will either succeed or stash failures, so next time we get here we'll have definitely sent them all
-			$log->{last_accessid} = $max_access_id_to_search;
-			$log->{message} = $self->_bulk_ping( \@accesses );
-		}
-		else
-		{
-			$self->_log( "legacy_notify: No more legacy accesses found, no more legacy_notify events will be scheduled." );
-			$log->{last_accessid} = $max_access_id_to_search;
-			$log->{message} = $up_to_date;
-		}
+		$self->_log( "bulk_upload_batch: No more legacy accesses found, no more bulk_upload_batch events will be scheduled." );
+		$log->{last_accessid} = $max_access_id_to_search;
+		$log->{message} = "Up to date";
+		$finished = 1;
 	}
+	
 
 	# Save log file
-	open( my $fh, ">", $logfile ) or do
+	open( my $fh, ">", $log_file ) or do
 	{
-		$self->_log("legacy_notify: Could not open $logfile: $!");
+		$self->_log("bulk_upload_batch: Could not open $log_file: $!");
 		return HTTP_INTERNAL_SERVER_ERROR;
 	};
-	print $fh $json->encode($log);
-	close($fh) or warn "Failed to close $logfile: $!";
+	print $fh $self->{json}->encode($log);
+	close($fh) or warn "bulk_upload_batch: Failed to close $log_file: $!";
 
 	# How did it go?
 	my $start_stamp = time();
-	if ( $log->{message} =~ m/^Sent/ )
+	if ( $success )
 	{
 		# Do next batch in one minute:
 		$log->{tries_since_last_success} = 0;
 		# $start_stamp += 60;
 		$start_stamp += 10;
 	}
-	elsif ( $log->{message} eq $up_to_date )
+	elsif ( $finished )
 	{
 		# All done!
 		return HTTP_OK;
 	}
 	else
 	{
-		# Retry in an hour:
+		# Failed. Retry in an hour:
 		$log->{tries_since_last_success}++;
 		$start_stamp += ( 60 * 60 );
 	}
@@ -260,9 +306,9 @@ sub legacy_notify
 		$start_stamp += ( 60 * 60 * 24 );
 	}
 	
-	$log->{message} .= ", ".$log->{last_accessid}." of ".$log->{maximum_access_id};
+	$log->{message} .= ", Uploaded up to ID ".$log->{last_accessid}.". Will stop when reached: ". ($log->{maximum_access_id}-1);
 
-	$self->_log( "legacy_notify: scheduling next run with message: ".$log->{message} );
+	$self->_log( "bulk_upload_batch: scheduling next run with message: ".$log->{message} );
 
 	# Spawn new job
 	my $task = EPrints::DataObj::EventQueue->create_unique(
@@ -270,120 +316,14 @@ sub legacy_notify
 		{
 			start_time => EPrints::Time::iso_datetime($start_stamp),
 			pluginid   => $self->get_id,
-			action     => "legacy_notify",
-			params     => [ $log->{message}, EPrints::Time::iso_datetime() ]
+			action     => "bulk_upload_batch",
+			params     => [ $log->{message}, $batch_name, EPrints::Time::iso_datetime() ]
 		}
 	);
-	$self->_log("new task status: " . $task->get_value( "status" ));
+	$self->_log("bulk_upload_batch: new task status: " . $task->get_value( "status" ));
 	return HTTP_OK;
 }
 
-=item $status = $self->notify( $self, $access, $request_url )
-
-Notifies the tracker about the given C<$access> event.
-
-Does not check for previously missed pings, we rely on the trigger to schedule a retry based on the return value of notify.
-
-=cut
-
-sub notify
-{
-	my ( $self, $access, $request_url ) = @_;
-	my $repo = $self->{repository};
-
-	my $msg = $self->_ping( $access, $request_url );
-	if ( $msg =~ m/^Sent/ )
-	{
-		$self->_log("notify: $msg");
-		return HTTP_OK;
-	}
-	else
-	{
-		$self->_log("notify: $msg");
-		return HTTP_INTERNAL_SERVER_ERROR;
-	}
-}
-
-=item $status = $self->retry( $self )
-
-If there are stashed events, they will be unstashed. The chronologically
-first 100 will be sent as a bulk tracking request. If there are any left
-over, they are stashed again and the job respawns.
-
-=cut
-
-sub retry
-{
-	my ($self) = @_;
-	my $repo   = $self->{repository};
-	my $size   = $repo->config( 'oaping', 'max_payload' ) // 100;
-	my $msg;
-
-	my @accesses = $self->_unstash();
-	if ( !@accesses )
-	{
-		$self->_log("retry: nothing unstashed.");
-		return HTTP_OK;
-	}
-	if ( @accesses > $size )
-	{
-		# Bulk ping will sort entries, but if choosing, need to choose
-		# the earliest ones:
-		my @sorted_accesses =
-		  sort { $a->[0]->value('datestamp') cmp $b->[0]->value('datestamp') }
-		  @accesses;
-		my @batch = @sorted_accesses[ 0 .. ( $size - 1 ) ];
-
-		$self->_log("retry: bulk pinging " . scalar(@batch));
-
-		$msg = $self->_bulk_ping( \@batch, 1 );
-		$self->_log("retry: $msg");
-
-		# Stash the remainder:
-		my @stashed;
-		for my $tuple ( @sorted_accesses[ $size .. $#sorted_accesses ] )
-		{
-			push @stashed, $tuple;
-			my ( $deferred_access, $deferred_request_url ) = @{$tuple};
-			$self->_stash( $deferred_access, $deferred_request_url );
-		}
-		$self->_err_log(
-			'Too many stashed access events, saving some for next time.',
-			stashed => \@stashed );
-
-		# Tell the indexer to retry this job.
-		my $event = $self->{event};
-		if ( $msg =~ m/^Sent/ )
-		{
-			# Success - wait 1 min
-			$event->set_value( 'start_time',
-				EPrints::Time::iso_datetime( time() + 60 ) );
-		}
-		else
-		{
-			# Failure - wait 10 min
-			$event->set_value( 'start_time',
-				EPrints::Time::iso_datetime( time() + ( 10 * 60 ) ) );
-		}
-
-		# Set status to 'waiting' and commit:
-		return HTTP_RESET_CONTENT;
-	}
-	else
-	{
-		$msg = $self->_bulk_ping( \@accesses, 1 );
-		$self->_log("retry: $msg");
-	}
-
-	if ( $msg =~ m/^Sent/ )
-	{
-		return HTTP_OK;
-	}
-	else
-	{
-		return HTTP_INTERNAL_SERVER_ERROR;
-	}
-}
 
 =back
 
@@ -430,9 +370,88 @@ sub _accesses_between
 	my @accesses;
 	foreach my $access ( $results->slice() )
 	{
+		# print STDERR "Pushing to accesses\n";
+		# use Data::Dumper;
+		# print STDERR Dumper($access);
 		push @accesses, [$access];
 	}
-	return @accesses;
+	return \@accesses;
+}
+
+
+=item $yesterday = $self->yesterdays_date( )
+
+Get the date string for yesterday
+
+=cut
+sub yesterdays_date
+{
+	my ( $self ) = @_;
+	
+
+	my ($year,$mon,$day,$hour,$min,$sec) = EPrints::Time::utc_datetime();
+	my ($y2, $m2, $d2) = Add_Delta_Days($year, $mon, $day, -1);
+
+	my $yesterday = sprintf("%04d-%02d-%02d", $y2, $m2, $d2);
+	return $yesterday;
+}
+
+=item $access_id = $self->_get_day_access_id( $day, $last )
+
+Get the last/first access_id for a specific day where $day is %Y-%m-%d
+$last: 1 for the last id in this date. 0 for the first
+
+=cut
+
+sub _get_day_access_id
+{
+	my ( $self, $day, $last ) = @_;
+
+	my $order = "-datestamp";
+	if (!$last){
+		$order = "datestamp";
+	}
+
+	my %params = (
+		session       => $self->{repository},
+		dataset       => $self->_access_dataset,
+		search_fields => [
+			{
+				meta_fields => ['accessid'],
+				match => 'SET'
+			},
+			{ 
+				meta_fields => ['datestamp'],
+				value       => "$day",
+				match => 'EQ'
+			},
+			{ meta_fields => ['referent_id'], match => 'SET' },
+		],
+		custom_order => $order,
+		allow_blank  => 0,
+		limit        => 1
+	);
+	my $search  = EPrints::Search->new(%params);
+	my $results = $search->perform_search;
+	my $total   = $results->count;
+	print "total: $total\n";
+	if ($total != 1){
+		return undef;
+	}
+
+	return @{$results->ids}[0];
+	# use Data::Dumper;
+	# # $Data::Dumper::Maxrecurse =2;
+	# $Data::Dumper::Maxdepth = 2;
+	# print STDERR Dumper($results);
+	# my @accesses;
+	# foreach my $access ( $results->slice() ){
+	# 	push @accesses, [$access];
+	# }
+	# return @accesses;
+
+	# return $results->slice();
+
 }
 
 =item ($id1, $id2) | $id2 = $self->_archive_id ( $any )
@@ -482,7 +501,7 @@ sub _as_form
 
 	# Required parameters:
 	my %qf_params = (
-		idsite => $repo->config( 'oaping', 'idsite' ),
+		idsite => $repo->config( 'matomo', 'idsite' ),
 		rec    => '1',
 	);
 
@@ -494,8 +513,8 @@ sub _as_form
 	  : 0;
 
 	# Recommended parameters:
-	# - action_name
-	my $action_name = $is_request ? REQUEST : INVESTG;
+	# - action_name ("The title of the action being tracked.")
+	my $action_name = $is_request ? DOWNLOAD : VIEW;
 	$qf_params{action_name} = $action_name;
 
 	# - url
@@ -598,63 +617,66 @@ sub _as_form
 	return %qf_params;
 }
 
-=item first_run( $repository, $access_id )
+=item initiate_historic_upload( $repository )
 
 Check to see if this plugin has just been installed - if so, make a log of current access request and 
 kick off the legacy indexer task.
 
 =cut
 
-sub first_run
+sub initiate_historic_upload
 {
-	my ( $self, $repo, $access_id ) = @_;
+	my ( $self, $repo, $from_access_id ) = @_;
 
-	my $donefile = $repo->config('variables_path') . SETUP_DONE;
+	$from_access_id //= $repo->config( 'matomo', 'legacy_start_access_id' );
+	$self->_ensure_path_exists($repo->config('variables_path') . LOG_FILES_DIR);
 
-	if(-e $donefile){
-		# file exists, not first run
-		return HTTP_OK;
+	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . LEGACY_BATCH_NAME . ".log";
+
+	if(-e $log_file){
+		# log file exists, so the legacy batch is already in progress
+		$self->_log("Legacy access data is already being uploaded. Do you want to restart batch ". LEGACY_BATCH_NAME. " instead?");
+		return 0;
 	}
-	# race condition between threads here
+	my $today = EPrints::Time::iso_date();
+	#trigger up to but not including the first result today
+	#the cron job will run in the early hours tomorrow morning to send off today's (it's yesterday) accesses
+	my $to_access_id = $self->_get_day_access_id($today, 0);
 
-	# Create the file if it doesn't exist
-	open (my $file, ">", $donefile) or do{
-		$self->_log("first_run: Could not open $donefile: $!");
-		return HTTP_INTERNAL_SERVER_ERROR;
-	};
-	close $file or warn "Failed to close $donefile: $!";
-
-	$self->_log("first_run: Will commence legacy_notify up to access id $access_id");
-
-	#create the legacy logfile with a maximum access id so it knows when it's caught up
-
-	my $logfile = $repo->config('variables_path') . LEGACY_LOG;
-
-	my $json    = JSON->new->allow_nonref(1)->canonical(1)->pretty(1);
-
-	my $log = { tries_since_last_success => 0 };
-	$log->{last_accessid} = $repo->config( 'oaping', 'legacy_start_access_id' ) // 0;
-	$log->{tries_since_last_success} = 0;
-	$log->{maximum_access_id} = $access_id;
-
-	# Save log file
-	open( my $fh, ">", $logfile ) or do
-	{
-		$self->_log("first_run: Could not open $logfile: $!");
-		return HTTP_INTERNAL_SERVER_ERROR;
-	};
-	print $fh $json->encode($log);
-	close($fh) or warn "Failed to close $logfile: $!";
-
-	# kick off the indexer 
-	my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
-		pluginid => 'Event::OAPingEvent',
-		action => 'legacy_notify',
-		params => [ 0, "First run of reporting legacy access" ],
-	});
+	$self->_log("initiate_historic_upload: Will commence " . LEGACY_BATCH_NAME ." from access id $from_access_id to $to_access_id");
 	
-	return HTTP_OK;
+	my $status = $self->trigger_bulk_upload(LEGACY_BATCH_NAME, $from_access_id , $to_access_id );
+	
+	return $status;
 
+}
+
+
+sub initiate_yesterdays_upload
+{
+	my ( $self, $repo ) = @_;
+
+	my $yesterday = $self->yesterdays_date();
+	my $batch_name = "daily_".$yesterday;
+
+	$self->_ensure_path_exists($repo->config('variables_path') . LOG_FILES_DIR);
+
+	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . "$batch_name.log";
+
+	if(-e $log_file){
+		# log file exists, so the legacy batch is already in progress
+		$self->_log("Yesterday's access data is already being uploaded. Do you want to restart batch $batch_name instead?");
+		return 0;
+	}
+	my $today = EPrints::Time::iso_date();
+	my $from_access_id = $self->_get_day_access_id($yesterday, 0);
+	my $to_access_id = $self->_get_day_access_id($yesterday, 1);
+
+	$self->_log("initiate_yesterdays_upload: Will commence $batch_name from access id $from_access_id to $to_access_id");
+	
+	my $status = $self->trigger_bulk_upload($batch_name,  $from_access_id, $to_access_id );
+	
+	return $status;
 }
 
 =item $message = $self->_bulk_ping( $accesses, [ $is_recovery ] )
@@ -673,17 +695,17 @@ logged, so they can be compared against the lists of previously stashed ones.
 
 Any events that failed to send are stashed.
 
-Returns a log message indicating how it went.
+Returns a 1 for success or 0 for failure.
 
 =cut
 
 sub _bulk_ping
 {
-	my ( $self, $accesses, $is_recovery ) = @_;
+	my ( $self, $accesses) = @_;
 	my $repo = $self->{repository};
 
-	my $tracker_url = URI->new( $repo->config( 'oaping', 'tracker' ) );
-	my $token_auth  = $repo->config( 'oaping', 'token_auth' );
+	my $tracker_url = URI->new( $repo->config( 'matomo', 'tracker' ) );
+	my $token_auth  = $repo->config( 'matomo', 'token_auth' );
 
 	# Filter out unusable events:
 	my @events;
@@ -702,29 +724,18 @@ sub _bulk_ping
 		}
 	}
 
-	my $msg;
-
 	# Can't continue if that leaves us with nothing:
-	return 'No usable events' unless @events;
+	if  (!@events){
+		self->log("No usable events to upload");
+		return 0;
+	};
 
 	# Can't continue if can't authenticate, so stash:
 	if ( !defined $token_auth )
 	{
-		$msg = 'Missing authorization token';
-		my @stashed;
-		foreach my $event (@events)
-		{
-			push @stashed, [ $event->{a}, $event->{u} ];
-			$self->_stash( $event->{a}, $event->{u} );
-		}
-		$self->_err_log( $msg, stashed => \@stashed );
-		return $msg;
+		self->log('Missing authorization token');
+		return 0;
 	}
-
-	# Sort all events into chronological order
-	# (they will already be ordered if from database search,
-	# but not if rescued from the stash):
-	my @sorted_events = sort { $a->{p}{cdt} cmp $b->{p}{cdt} } @events;
 
 	# According to BulkTracking/Tracker/Requests.php, each member of
 	# the requests array can be either be a URL string (in which case
@@ -735,77 +746,36 @@ sub _bulk_ping
 		requests   => [],
 		token_auth => $token_auth,
 	};
-	foreach my $event (@sorted_events)
+	foreach my $event (@events)
 	{
 		push @{ $payload->{requests} }, $event->{p};
 	}
 
 	# Turn into payload JSON string.
-	my $json    = JSON->new->utf8->allow_nonref(0)->canonical(1)->pretty(0);
-	my $content = $json->encode($payload);
+	my $content = $self->{json}->encode($payload);
 	my $response = $self->_user_agent->post(
 		$tracker_url,
 		Content_Type => 'application/json',
 		Accept       => 'application/json',
 		Content      => $content,
 	);
-	
-	my $error;
-	my %err_details;
-	my @sent   = @sorted_events;
-	my @unsent = @sorted_events;
 
 	if (   $response->header('Client-Warning')
 		&& $response->header('Client-Warning') eq 'Internal response"' )
 	{
-		@sent  = ();
-		$error = 'Failed to send request';
+		self->log('Failed to send request');
+		return 0;
 	}
 	elsif ( $response->code > 399 )
 	{
-		$error =
-		  'Tracker responded ' . $response->code . ' ' . $response->message;
-		$err_details{response} = $response->decoded_content();
-		my $report = eval { $json->decode( $response->content() ) }
-		  or $error .= '. Could not parse content of response.';
-		my $tracked = 0;
-		if ( $report && exists $report->{tracked} )
-		{
-			$tracked = $report->{tracked};
-		}
-		@sent   = $tracked ? @sorted_events[ 0 .. ( $tracked - 1 ) ] : ();
-		@unsent = @sorted_events[ $tracked .. $#sorted_events ];
+		self->log('Tracker responded ' . $response->code . ' ' . $response->message);
+		return 0;
 	}
 	else
 	{
-		$self->_log("_bulk_ping successfully submitted " . scalar(@unsent) . " access events");
-		# success!?
-		@unsent = ();
+		$self->_log("_bulk_ping successfully submitted " . scalar(@events) . " access events");
+		return 1;
 	}
-
-	foreach my $event (@unsent)
-	{
-		push @{ $err_details{stashed} }, [ $event->{a}, $event->{u} ];
-		$self->_stash( $event->{a}, $event->{u} );
-	}
-
-	$msg = "Sent ${\scalar @sent} events to tracker";
-	my $log_msg = $error ? $error : $msg;
-
-	if ($is_recovery)
-	{
-		foreach my $event (@sent)
-		{
-			push @{ $err_details{sent} }, [ $event->{a}, $event->{u} ];
-		}
-		$self->_err_log( $log_msg, %err_details );
-	}
-	elsif ($error)
-	{
-		$self->_err_log( $log_msg, %err_details );
-	}
-
-	return $log_msg;
 }
 
 =item $ds = $self->_access_dataset
@@ -862,14 +832,14 @@ sub _eprint_dataset
 	return $self->{eprint_ds};
 }
 
-=item $bool = $self->_ensure_path( $path )
+=item $bool = $self->_ensure_path_exists( $path )
 
 Returns 1 if path already exists or has been successfully created.
 Returns 0 if path still does not exist after best efforts.
 
 =cut
 
-sub _ensure_path
+sub _ensure_path_exists
 {
 	my ( $self, $path ) = @_;
 
@@ -892,7 +862,7 @@ sub _ensure_path
 			{
 				$msg = " $f: $msg";
 			}
-			$self->_log("_ensure_path: Error creating directory$msg");
+			$self->_log("_ensure_path_exists: Error creating directory$msg");
 		}
 		return 0;
 	}
@@ -984,127 +954,12 @@ Write message to Indexer log.
 sub _log
 {
 	my ( $self, $msg ) = @_;
-	if ( $self->{repository}->config( 'oaping', 'verbosity' ) )
+	if ( $self->{repository}->config( 'matomo', 'verbosity' ) )
 	{
-		$self->{repository}->log("OAPingEvent::$msg");
+		$self->{repository}->log("MatomoEvent::$msg");
 		select()->flush();
 	}
 	return;
-}
-
-=item $message = $self->_ping( $access, [ $request_url ] )
-
-Sends a ping to the configured Matomo Tracking HTTP API, representing a single
-access event. On failure, the event is stashed.
-
-A request URL will be calculated if blank or undefined.
-
-Returns a log message indicating how it went.
-
-=cut
-
-sub _ping
-{
-	my ( $self, $access, $request_url ) = @_;
-	my $repo = $self->{repository};
-
-	# Convert access to form data:
-	my %qf_params = $self->_as_form( $access, $request_url );
-	return unless %qf_params;
-
-	# Add random number to prevent caching:
-	$qf_params{rand} = int( rand(10000) );
-
-	my $token_auth = $repo->config( 'oaping', 'token_auth' );
-	if ( defined $token_auth )
-	{
-		$qf_params{token_auth} = $token_auth;
-	}
-	else
-	{
-		# Of course, should never happen.
-		$self->_log("_ping: token_auth not found!");
-
-		# Dangerous to send info if will be attributed to now instead of then.
-		if ( exists $qf_params{cdt} )
-		{
-			$self->_stash( $access, $request_url );
-			my $error = 'Could not notify of dated access without token_auth';
-			#https://developer.matomo.org/api-reference/tracking-api - "If you set cdt to a datetime older than 24 hours then token_auth must be set."
-			$self->_err_log( $error, stashed => [ [ $access, $request_url ] ] );
-			return $error;
-		}
-
-		# Move to a non-authenticated key.
-		if ( exists $qf_params{cip} )
-		{
-			$qf_params{uid} = $qf_params{cip};
-			delete $qf_params{cip};
-		}
-	}
-
-	my $response = $self->_user_agent->post($repo->config( 'oaping', 'tracker' ), \%qf_params);
-	my $error;
-	my %err_details;
-	if (   $response->header('Client-Warning')
-		&& $response->header('Client-Warning') eq 'Internal response"' )
-	{
-		$error = 'Failed to send request';
-	}
-	elsif ( $response->code > 399 )
-	{
-		$error =
-		  'Tracker responded ' . $response->code . ' ' . $response->message;
-		$err_details{response} = $response->decoded_content();
-	}
-
-	if ($error)
-	{
-		$self->_stash( $access, $request_url );
-		$err_details{stashed} = [ [ $access, $request_url ] ];
-		$self->_err_log( $error, %err_details );
-		return $error;
-	}
-
-	my $accessid = $access->id;
-	return "Sent access $accessid to tracker";
-}
-
-=item $ok = $self->_stash($access, $request_url )
-
-Records a failed ping attempt so it can be retried later.
-
-Stashing an event converts an undefined C<%request_url> to an empty string.
-
-=cut
-
-sub _stash
-{
-	my ( $self, $access, $request_url ) = @_;
-	$request_url //= q();
-	my $repo = $self->{repository};
-	my $panic_msg =
-		"_stash: Could not stash ping for access "
-	  . $access->id . " = "
-	  . ( $request_url || "???" );
-
-	my $replay_dir = $repo->config('variables_path') . REPLAY_DIR;
-
-	if ( !$self->_ensure_path($replay_dir) )
-	{
-		$self->_log($panic_msg);
-		return 0;
-	}
-
-	my $replay_file = $replay_dir . '/' . $access->id;
-	open( my $fh, '>', $replay_file ) or do
-	{
-		$self->_log($panic_msg);
-		return 0;
-	};
-	print $fh $request_url;
-	close($fh) or warn "Failed to close $replay_file: $!";
-	return 1;
 }
 
 =item $ua = $self->_user_agent
@@ -1127,47 +982,114 @@ sub _user_agent
 	return $self->{ua};
 }
 
-=item @accesses = $self->_unstash()
+# =item $self->create_internal_tables()
 
-Loads and removes stashed access events and returns them as an array of arrayrefs,
-where the first element is an C<$access> object and the second is a request URL.
-Elements are not likely to be in chronological order.
+# Duplicated code taken from irstats, this provides us with a thread safe store of key-value pairs.
 
-=cut
+# There is a feature request for EPrints 3.5 to have a generic mechanism to do this, but until then we'll create our own table
 
-sub _unstash
-{
-	my ($self) = @_;
-	my $repo = $self->{repository};
+# =cut
 
-	my @accesses;
+# sub create_internal_tables
+# {
+# 	my( $self ) = @_;
+	
+# 	my $dbh = $self->{dbh};
+# 	if (!defined $dbh){
+# 		return 0;
+# 	}
 
-	my $replay_dir = $repo->config('variables_path') . REPLAY_DIR;
+# 	my $rc = 1;	
+# 	if( $dbh->has_table( $INTERNAL_TABLE ) )
+# 	{
+# 		return 1;
+# 	}
+	
+# 	my $session = $self->{session};
 
-	if ( !$self->_ensure_path($replay_dir) )
-	{
-		return @accesses;
-	}
+# 	my @fields;
 
-	opendir( my $dh, $replay_dir ) || return @accesses;
-	while ( my $accessid = readdir($dh) )
-	{
-		next if $accessid =~ /^\.{1,2}$/;
-		my $access = $self->_access_dataset->get_object( $repo, $accessid );
-		next unless defined $access;
-		open( my $fh, '<', "$replay_dir/$accessid" ) or next;
-		read( $fh, my $request_url, -s $fh );
-		close($fh) or warn "Failed to close $replay_dir/$accessid: $!";
-		$request_url =~ s/^\s+|\s+$//g;
-		push @accesses, [ $access, $request_url ];
-		unlink "$replay_dir/$accessid";
-	}
-	closedir($dh);
+# 	push @fields, EPrints::MetaField->new(
+# 				repository => $session->get_repository,
+# 				name => "key",
+# 				type => "text",
+# 				maxlength => 255,
+# 				sql_index => 0
+# 	);
 
-	$self->_log("_unstash: " . scalar(@accesses));
+# 	push @fields, EPrints::MetaField->new(
+# 				repository => $session->get_repository,
+# 				name => "value",
+# 				type => "text",
+# 				maxlength => 255,
+# 				sql_index => 0
+# 	);
 
-	return @accesses;
-}
+# 	$rc &= $self->_create_table( $INTERNAL_TABLE, 1, @fields );
+
+# 	return $rc;
+# }
+
+# # Retrieves the stored value '$key'. The main use of this is for locking (see above) and also to keep track of the accessid when doing
+# # incremental updates of the stats (so to know where to restart from).
+# sub get_internal_value
+# {
+# 	my( $self, $key ) = @_;
+	
+# 	my $dbh = $self->{dbh};
+# 	return undef unless( defined $dbh && $dbh->has_table( $INTERNAL_TABLE ) );
+
+# 	my $Q_value = $dbh->quote_identifier( 'value' );
+# 	my $sql = "SELECT $Q_value FROM ".$dbh->quote_identifier( $INTERNAL_TABLE )." WHERE ".$dbh->quote_identifier("key")."=".$dbh->quote_value($key);
+# 	my $sth = $dbh->prepare( $sql );
+#         $dbh->execute( $sth, $sql );
+# 	my @r = $sth->fetchrow_array;
+# 	return $r[0];
+# }
+
+# # sets the internal value '$key'
+# # $replace is an optional boolean which asks to replace the current value (if any), otherwise the current value will be +=
+# # Default behaviour is to replace the existing value
+# sub set_internal_value
+# {
+# 	my( $self, $key, $newval, $replace, $insert ) = @_;
+	
+# 	$replace = 1 unless( defined $replace );
+# 	$insert ||= 0;
+
+# 	my $dbh = $self->{dbh};
+# 	return undef unless( defined $dbh );
+
+# 	my $curval = $self->get_internal_value( $key );
+# 	if( defined $curval && !$insert )
+# 	{
+# 		$newval += $curval unless( defined $replace );
+# 		return $dbh->_update( $INTERNAL_TABLE, ['key'], [$key], ['value'], [$newval] );
+# 	}
+# 	else
+# 	{
+#                 my @v;
+#                 push @v, [$key, $newval];
+#                 return $dbh->insert( $INTERNAL_TABLE, ['key', 'value'], @v );
+# 	}
+
+# 	return 0;
+# }
+
+# # Removes a previously stored internal value.
+# sub reset_internal_value
+# {
+# 	my( $self, $key ) = @_;
+
+# 	return 1 unless( defined $key );
+
+# 	my $Q_tablename = $self->{dbh}->quote_identifier( $INTERNAL_TABLE );
+# 	my $Q_key = $self->{dbh}->quote_identifier( "key" );
+# 	my $Q_value = $self->{dbh}->quote_value( $key );
+
+# 	return $self->{dbh}->do( "DELETE FROM $Q_tablename WHERE $Q_key = $Q_value" );
+# }
+
 
 =back
 
