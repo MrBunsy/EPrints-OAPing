@@ -180,7 +180,7 @@ sub trigger_bulk_upload
 	my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
 		pluginid => 'Event::MatomoEvent',
 		action => 'bulk_upload_batch',
-		params => [ "First run of reporting legacy access", $batch_name, EPrints::Time::iso_datetime() ],
+		params => [ "First run of $batch_name access", $batch_name, EPrints::Time::iso_datetime() ],
 	});
 
 	return $event->get_value( "status" )
@@ -263,7 +263,7 @@ sub bulk_upload_batch
 	}
 	else
 	{
-		$self->_log( "bulk_upload_batch: No more legacy accesses found, no more bulk_upload_batch events will be scheduled." );
+		$self->_log( "bulk_upload_batch: No more accesses found, no more bulk_upload_batch events will be scheduled for $batch_name." );
 		$log->{last_accessid} = $max_access_id_to_search;
 		$log->{message} = "Up to date";
 		$finished = 1;
@@ -619,8 +619,7 @@ sub _as_form
 
 =item initiate_historic_upload( $repository )
 
-Check to see if this plugin has just been installed - if so, make a log of current access request and 
-kick off the legacy indexer task.
+Schedule the first indexer task which will slowly upload all historic access data from {matomo}->{legacy_start_access_id} to the end of yesterday (UTC)
 
 =cut
 
@@ -651,6 +650,11 @@ sub initiate_historic_upload
 
 }
 
+=item initiate_yesterdays_upload( $repository )
+
+Schedule the first indexer task which will slowly upload all access data from yesterday (UTC)
+
+=cut
 
 sub initiate_yesterdays_upload
 {
@@ -664,7 +668,7 @@ sub initiate_yesterdays_upload
 	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . "$batch_name.log";
 
 	if(-e $log_file){
-		# log file exists, so the legacy batch is already in progress
+		# log file exists, so the batch is already in progress
 		$self->_log("Yesterday's access data is already being uploaded. Do you want to restart batch $batch_name instead?");
 		return 0;
 	}
@@ -677,6 +681,34 @@ sub initiate_yesterdays_upload
 	my $status = $self->trigger_bulk_upload($batch_name,  $from_access_id, $to_access_id );
 	
 	return $status;
+}
+
+=item restart_batch( $repository, $batch_name )
+
+Reschedule an indexer task for a specific batch
+
+=cut
+
+sub restart_batch
+{
+	my ( $self, $repo, $batch_name ) = @_;
+	$self->_ensure_path_exists($repo->config('variables_path') . LOG_FILES_DIR);
+
+	my $log_file = $repo->config('variables_path') . LOG_FILES_DIR . "$batch_name.log";
+
+	if(-e $log_file){
+		# log file exists, so the batch has run before
+		my $event = EPrints::DataObj::EventQueue->create_unique( $repo, {
+			pluginid => 'Event::MatomoEvent',
+			action => 'bulk_upload_batch',
+			params => [ "Restart batch $batch_name", $batch_name, EPrints::Time::iso_datetime() ],
+		});
+	
+		return $event->get_value( "status" );
+	}else{
+		$self->_log("No log file found for $batch_name. Cannot restart.")
+	}
+	return 0;
 }
 
 =item $message = $self->_bulk_ping( $accesses, [ $is_recovery ] )
