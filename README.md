@@ -1,11 +1,13 @@
-# EPrints-matomo
+# EPrints-Matomo
 
-*Alternative EPrints extension for sending usage pings to the OpenAIRE Matomo
-tracking API*
+*Alternative EPrints extension for sending usage pings to the Matomo tracking API (OpenAIRE uses Matomo)*
 
-This is a fork and major refactor of the work by Alex Ball: https://github.com/alex-ball/EPrints-matomo/
+This is a fork and major refactor of the work by Alex Ball: https://github.com/alex-ballEPrints-OAPing/
 
-The refactor was intended to make this easier to deploy with minimal manual intervention required, but preserving the robustness added over the original plugin.
+Changes from EPrints-OAPing:
+ - Only bulk uploads, no live pings
+ - Explicit support for any Matomo instance, not just OpenAIRE
+ - Minimal setup required to upload historic access data
 
 ## Installation
 
@@ -14,28 +16,13 @@ You can install this as an ingredient that you can then load into archives on a 
 Check out the git repository into into your `~eprints/ingredients` folder, where
 `~eprints` is typically something like `/opt/eprints3`.
 
-For EPrints 3.4, edit `flavours/pub_lib/inc` and add the line `ingredients/EPrints-matomo`
+For EPrints 3.4, edit `flavours/pub_lib/inc` and add the line `ingredients/EPrints-Matomo`
 
 ## Configuration
 
-To configure the ingredient for your archive, copy `ingredients/EPrints-matomo/cfg.d/matomo_config.pl` to `archives/[YOUR_ARCHIVE_ID]/cfg/cfg.d/matomo_config.pl`.
+To configure the ingredient for your archive, copy `ingredients/EPrints-Matomo/cfg.d/z_matomo_config.pl.example` to `archives/[YOUR_ARCHIVE_ID]/cfg/cfg.d/z_matomo_config.pl`.
 
 You will want to configure at least `$c->{matomo}->{idsite}` and `$c->{matomo}->{token_auth}`.
-
-Create a file to contain your OpenAIRE tracking credentials:
-
-It is also good practice to restrict access to the file so it can only be
-read by the user(s) as which the Web server and Indexer run. If they both only
-run as `eprints`, this would work:
-
-```bash
-chown eprints ~eprints/archives/ARCHIVE_ID/cfg/cfg.d/matomo_config.pl
-chmod 600 ~eprints/archives/ARCHIVE_ID/cfg/cfg.d/matomo_config.pl
-```
-
-There are a few other configuration options. By default the ingredient will beginning sending all historic access requests, in batches, in the background.
-
-To disabled this set `$c->{matomo}->{legacy_catchup} = 0`. If the legacy catchup has already started and you wish to stop it, delete the `legacy_notify` event from the indexer. 
 
 Remember to restart both the server and Indexer after changing the
 configuration.

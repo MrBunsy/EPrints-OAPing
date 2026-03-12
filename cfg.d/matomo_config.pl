@@ -15,17 +15,6 @@ at provide.openaire.eu, as MatomoID (site identifier) and AuthenticationToken
 $c->{matomo}->{idsite} = '1234';
 $c->{matomo}->{token_auth} = 'abcde';
 
-=item $c->{matomo}->{legacy_catchup}
-
-If you are installing the plugin into a running repository and want to send
-tracking information for historic Accesses, leave C<legacy_catchup> set to 1.
-
-Otherwise, set C<notify_mode> to 0 to start tracking new Accesses only.
-
-=cut
-
-$c->{matomo}->{legacy_catchup} = 1;
-
 =item $c->{matomo}->{legacy_start_access_id}
 
 If legacy_catchup is enabled, this is the access id it will start from
@@ -44,13 +33,13 @@ at least 60 seconds apart, busy repositories might need a higher value.
 
 $c->{matomo}->{max_payload} = 1000;
 
-=item $c->{matomo}->{legacy_catchup_period_s}
+=item $c->{matomo}->{bulk_upload_period_s}
 
 Time between bulk pings (in seconds) if the number of accesses exceeds max_payload (for both legacy and end-of-day)
 
 =cut
 
-$c->{matomo}->{legacy_catchup_period_s} = 60;
+$c->{matomo}->{bulk_upload_period_s} = 60;
 
 =item $c->{matomo}->{verbosity}
 
@@ -67,7 +56,7 @@ $c->{matomo}->{verbosity} = 1;
 
 =item $c->{plugins}->{'Event::MatomoEvent'}->{params}->{disable}
 
-In the normal fashion, set the plugin's C<disable> parameter to 0 to enable or 1
+In the normal EPrints fashion, set the plugin's C<disable> parameter to 0 to enable or 1
 to disable.
 
 =cut

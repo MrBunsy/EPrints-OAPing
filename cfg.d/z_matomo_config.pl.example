@@ -1,0 +1,24 @@
+=item *
+
+Place this file in your archive and use it to override any of the default configuration.
+
+B<z_matomo_config.pl> - Credentials (not included):
+
+	$c->{matomo}->{idsite} - site identifier
+	$c->{matomo}->{token_auth} - authorization token
+
+These are available from the Usage Counts page when managing your repository
+at provide.openaire.eu, as MatomoID (site identifier) and AuthenticationToken
+
+=back
+
+=cut
+
+$c->{matomo}->{idsite} = '1234';
+$c->{matomo}->{token_auth} = 'abcde';
+
+# Change this URL if not targetting OpenAIRE.
+#$c->{matomo}->{tracker} = 'https://analytics.openaire.eu/piwik.php';
+
+# Increase this if your instance has heavy Usage
+#$c->{matomo}->{max_payload} = 1000;

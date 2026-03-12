@@ -283,10 +283,10 @@ sub bulk_upload_batch
 	my $start_stamp = time();
 	if ( $success )
 	{
-		# Do next batch in one minute:
+		# Do next batch in one minute (by default):
 		$log->{tries_since_last_success} = 0;
-		# $start_stamp += 60;
-		$start_stamp += 10;
+		$start_stamp += $repo->config( 'matomo', 'bulk_upload_period_s' ) // 60;
+		$log->{message} .= ", Uploaded up to ID ".$log->{last_accessid}.". Will stop when reached: ". ($log->{maximum_access_id}-1);
 	}
 	elsif ( $finished )
 	{
@@ -306,7 +306,6 @@ sub bulk_upload_batch
 		$start_stamp += ( 60 * 60 * 24 );
 	}
 	
-	$log->{message} .= ", Uploaded up to ID ".$log->{last_accessid}.". Will stop when reached: ". ($log->{maximum_access_id}-1);
 
 	$self->_log( "bulk_upload_batch: scheduling next run with message: ".$log->{message} );
 
@@ -434,8 +433,9 @@ sub _get_day_access_id
 	my $search  = EPrints::Search->new(%params);
 	my $results = $search->perform_search;
 	my $total   = $results->count;
-	print "total: $total\n";
+
 	if ($total != 1){
+		$self->_log("Search returned $total results for accesses yesterday");
 		return undef;
 	}
 
@@ -642,6 +642,11 @@ sub initiate_historic_upload
 	#the cron job will run in the early hours tomorrow morning to send off today's (it's yesterday) accesses
 	my $to_access_id = $self->_get_day_access_id($today, 0);
 
+	if(! defined $to_access_id){
+		$self->_log("Unable to find access id from the beginning of today. Unable to initiate historic data upload");
+		return 0;
+	}
+
 	$self->_log("initiate_historic_upload: Will commence " . LEGACY_BATCH_NAME ." from access id $from_access_id to $to_access_id");
 	
 	my $status = $self->trigger_bulk_upload(LEGACY_BATCH_NAME, $from_access_id , $to_access_id );
@@ -675,6 +680,11 @@ sub initiate_yesterdays_upload
 	my $today = EPrints::Time::iso_date();
 	my $from_access_id = $self->_get_day_access_id($yesterday, 0);
 	my $to_access_id = $self->_get_day_access_id($yesterday, 1);
+
+	if(! defined $to_access_id || ! defined $from_access_id){
+		$self->_log("Unable to find access id from the beginning or end of yesterday. Unable to initiate data upload");
+		return 0;
+	}
 
 	$self->_log("initiate_yesterdays_upload: Will commence $batch_name from access id $from_access_id to $to_access_id");
 	
@@ -736,7 +746,8 @@ sub _bulk_ping
 	my ( $self, $accesses) = @_;
 	my $repo = $self->{repository};
 
-	my $tracker_url = URI->new( $repo->config( 'matomo', 'tracker' ) );
+	# my $tracker_url = URI->new( $repo->config( 'matomo', 'tracker' ) );
+	
 	my $token_auth  = $repo->config( 'matomo', 'token_auth' );
 
 	# Filter out unusable events:
@@ -783,25 +794,54 @@ sub _bulk_ping
 		push @{ $payload->{requests} }, $event->{p};
 	}
 
+	my $tracker_url = HTTP::Request->new('POST', $repo->config( 'matomo', 'tracker' ));
+
+	$tracker_url->header( 'Content-Type' => 'application/json' );
+	
 	# Turn into payload JSON string.
 	my $content = $self->{json}->encode($payload);
-	my $response = $self->_user_agent->post(
-		$tracker_url,
-		Content_Type => 'application/json',
-		Accept       => 'application/json',
-		Content      => $content,
-	);
 
+	$tracker_url->content( $content );
+
+	my $response = $self->_user_agent->request($tracker_url);
+	# if we submmit json with the correct content-type header, we should get json back
+	my $returned_json = eval { $self->{json}->decode($response->decoded_content) } or do
+	{
+		$self->_log("Could not parse expected json response from Matomo ", 1);
+		return 0;
+	};
 	if (   $response->header('Client-Warning')
 		&& $response->header('Client-Warning') eq 'Internal response"' )
 	{
-		self->log('Failed to send request');
+		$self->_log('Failed to send request', 1);
 		return 0;
 	}
 	elsif ( $response->code > 399 )
 	{
-		self->log('Tracker responded ' . $response->code . ' ' . $response->message);
+		$self->_log('Tracker responded ' . $response->code . ' ' . $response->message. " Content: " . $response->decoded_content, 1);
 		return 0;
+	}
+	elsif(!defined $returned_json->{invalid} || !defined $returned_json->{tracked} || !defined $returned_json->{status})
+	{
+		$self->_log('Tracker did not respond with expected JSON format', 1);
+		return 0;
+	}elsif($returned_json->{status} ne "success")
+	{
+		$self->_log('Tracker responded with status :' . $returned_json->{status}, 1);
+		return 0;
+	}
+	elsif ($returned_json->{tracked} == 0) 
+	{
+		$self->_log('Tracker responded with no tracked events', 1);
+		return 0;
+	}
+	elsif (int($returned_json->{invalid}) > 0 || $returned_json->{tracked} != scalar(@events)) 
+	{
+		$self->_log('Tracker responded with fewer tracked events that submitted. Tracked events: ' . $returned_json->{tracked} . " expected: " .scalar(@events), 1);
+		# assumption here - if we had ANY successfully tracked events then we should just continue. Otherwise
+		# there's a risk we get stuck forever trying to upload a broken event.
+		# we just above got more general failures and zero tracked events, so hopefully this only occurs with the odd broken event?
+		return 1;
 	}
 	else
 	{
@@ -985,8 +1025,8 @@ Write message to Indexer log.
 
 sub _log
 {
-	my ( $self, $msg ) = @_;
-	if ( $self->{repository}->config( 'matomo', 'verbosity' ) )
+	my ( $self, $msg, $always ) = @_;
+	if ( $self->{repository}->config( 'matomo', 'verbosity' ) || (defined $always && $always ) )
 	{
 		$self->{repository}->log("MatomoEvent::$msg");
 		select()->flush();
